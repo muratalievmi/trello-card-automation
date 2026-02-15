@@ -16,12 +16,13 @@ function runSingleGame(params: GenerationParams, seed: number): GameResult {
   const definition = generateGame({ ...params, seed });
   const engine = new GameEngine(definition);
 
-  // Create agents
+  // Vary agent strategies across runs for better balance measurement
+  const strategyOffset = seed % STRATEGIES.length;
   const agents: Agent[] = definition.roles.map((role, i) => ({
     id: `agent_${i}`,
     role,
-    strategy: STRATEGIES[i % STRATEGIES.length],
-    entityId: `e_${i + 1}`, // matches entity creation order
+    strategy: STRATEGIES[(i + strategyOffset) % STRATEGIES.length],
+    entityId: `e_${i + 1}`,
   }));
 
   engine.setup(agents);

@@ -73,14 +73,14 @@ export const CollectionMechanic: MechanicModule = {
         component: 'score',
         property: 'value',
         op: 'gte',
-        value: 10,
+        value: 3,
       },
       type: 'win',
     },
   ],
 };
 
-/** Combat mechanic: entities deal damage to each other. */
+/** Combat mechanic: entities deal damage to each other on proximity. */
 export const CombatMechanic: MechanicModule = {
   name: 'combat',
   description: 'Entities can damage each other through proximity',
@@ -101,39 +101,9 @@ export const CombatMechanic: MechanicModule = {
       },
       priority: 5,
     },
-    {
-      id: 'death_check',
-      name: 'Remove Dead Entities',
-      trigger: { type: 'on_tick' },
-      condition: {
-        type: 'component_check',
-        entityTag: 'defender',
-        component: 'health',
-        property: 'current',
-        op: 'lte',
-        value: 0,
-      },
-      effect: { type: 'destroy', targetTag: 'defender' },
-      priority: 1,
-    },
   ],
-  goals: [
-    {
-      id: 'last_standing',
-      name: 'Last Entity Standing',
-      description: 'The last surviving entity wins',
-      condition: {
-        type: 'component_check',
-        entityTag: 'defender',
-        component: 'health',
-        property: 'current',
-        op: 'lte',
-        value: 0,
-      },
-      type: 'lose',
-      targetRole: 'defender',
-    },
-  ],
+  // Goals are generated per-player dynamically in generateGame
+  goals: [],
 };
 
 /** Survival mechanic: a timer ticks down; survive to win. */
@@ -191,22 +161,8 @@ export const RaceMechanic: MechanicModule = {
     },
   ],
   rules: [],
-  goals: [
-    {
-      id: 'reach_finish',
-      name: 'Reach the Finish Line',
-      description: 'First player to reach the finish line wins',
-      condition: {
-        type: 'component_check',
-        entityTag: 'player',
-        component: 'position',
-        property: 'x',
-        op: 'gte',
-        value: 9,
-      },
-      type: 'win',
-    },
-  ],
+  // Goal is generated dynamically in generateGame with correct boardSize
+  goals: [],
 };
 
 // ---------------------------------------------------------------------------
@@ -298,7 +254,8 @@ export function generateGame(params: GenerationParams): GameDefinition {
       components.push({ type: 'score', data: { value: 0 } });
     }
     if (neededComponents.has('timer') && !components.some((c) => c.type === 'timer')) {
-      components.push({ type: 'timer', data: { remaining: params.maxTicks, total: params.maxTicks, active: true } });
+      const timerDuration = Math.floor(params.maxTicks * 0.6);
+      components.push({ type: 'timer', data: { remaining: timerDuration, total: timerDuration, active: true } });
     }
     if (neededComponents.has('damage') && !components.some((c) => c.type === 'damage')) {
       components.push({ type: 'damage', data: { amount: 1, type: 'melee' } });
@@ -317,18 +274,30 @@ export function generateGame(params: GenerationParams): GameDefinition {
     entityTemplates.push({ tags, components });
   }
 
-  // Add module-specific entities (e.g., collectibles)
+  // Add module-specific entities (e.g., collectibles, finish lines)
   for (const mod of modules) {
     for (const template of mod.entityTemplates) {
-      // Spawn multiple instances with random positions
-      const count = rng.nextInt(3, 10);
-      for (let i = 0; i < count; i++) {
+      const isFinishLine = template.tags.includes('finish_line');
+
+      if (isFinishLine) {
+        // Place finish line at the far corner, don't randomize
         const cloned = structuredClone(template);
         const posComp = cloned.components.find((c) => c.type === 'position');
         if (posComp) {
-          posComp.data = { x: rng.nextInt(0, params.boardSize - 1), y: rng.nextInt(0, params.boardSize - 1) };
+          posComp.data = { x: params.boardSize - 1, y: params.boardSize - 1 };
         }
         entityTemplates.push(cloned);
+      } else {
+        // Spawn multiple instances with random positions
+        const count = rng.nextInt(3, 10);
+        for (let i = 0; i < count; i++) {
+          const cloned = structuredClone(template);
+          const posComp = cloned.components.find((c) => c.type === 'position');
+          if (posComp) {
+            posComp.data = { x: rng.nextInt(0, params.boardSize - 1), y: rng.nextInt(0, params.boardSize - 1) };
+          }
+          entityTemplates.push(cloned);
+        }
       }
     }
   }
@@ -343,6 +312,47 @@ export function generateGame(params: GenerationParams): GameDefinition {
   const goals: Goal[] = [];
   for (const mod of modules) {
     goals.push(...structuredClone(mod.goals));
+  }
+
+  // Generate race goal dynamically based on actual board size
+  const hasRace = modules.some((m) => m.name === 'race');
+  if (hasRace) {
+    goals.push({
+      id: 'reach_finish',
+      name: 'Reach the Finish Line',
+      description: 'First player to reach the finish line wins',
+      condition: {
+        type: 'component_check',
+        entityTag: 'player',
+        component: 'position',
+        property: 'x',
+        op: 'gte',
+        value: params.boardSize - 1,
+      },
+      type: 'win',
+    });
+  }
+
+  // Generate per-player combat goals dynamically
+  const hasCombat = modules.some((m) => m.name === 'combat');
+  if (hasCombat) {
+    for (let i = 0; i < params.playerCount; i++) {
+      goals.push({
+        id: `player_${i}_death`,
+        name: `Player ${i + 1} Defeated`,
+        description: `Player ${i + 1} is eliminated when health reaches zero`,
+        condition: {
+          type: 'component_check',
+          entityTag: `player_${i}`,
+          component: 'health',
+          property: 'current',
+          op: 'lte',
+          value: 0,
+        },
+        type: 'lose',
+        targetRole: `player_${i}`,
+      });
+    }
   }
 
   // Create roles

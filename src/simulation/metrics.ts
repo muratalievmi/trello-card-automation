@@ -27,20 +27,25 @@ export function computeMetrics(results: GameResult[]): SimulationMetrics {
   );
   const deadlockRate = deadlocked.length / total;
 
-  // Win rate variance
+  // Win rate variance — include all roles (even those with 0 wins)
+  const allRoles = new Set<string>();
   const winCounts: Record<string, number> = {};
   for (const r of results) {
+    for (const role of Object.keys(r.scores)) {
+      allRoles.add(role);
+      if (!winCounts[role]) winCounts[role] = 0;
+    }
     if (r.winner) {
       winCounts[r.winner] = (winCounts[r.winner] ?? 0) + 1;
     }
   }
-  const winRates = Object.values(winCounts).map((c) => c / total);
+  const winRates = [...allRoles].map((role) => (winCounts[role] ?? 0) / total);
   const winRateVariance = variance(winRates);
 
   // First-mover advantage
-  const player0Wins = winCounts['player_0'] ?? 0;
-  const lastPlayerId = Object.keys(winCounts).sort().pop();
-  const lastPlayerWins = lastPlayerId ? (winCounts[lastPlayerId] ?? 0) : 0;
+  const sortedRoles = [...allRoles].sort();
+  const player0Wins = winCounts[sortedRoles[0]] ?? 0;
+  const lastPlayerWins = winCounts[sortedRoles[sortedRoles.length - 1]] ?? 0;
   const firstMoverAdvantage =
     total > 0 ? Math.abs(player0Wins - lastPlayerWins) / total : 0;
 
