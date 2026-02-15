@@ -1,0 +1,25 @@
+{
+  "name": "meta-game-framework",
+  "version": "0.1.0",
+  "description": "A meta-game framework that generates playable games from composable primitives",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/web/server.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "simulate": "tsx src/simulation/run.ts",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
