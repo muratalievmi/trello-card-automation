@@ -55,13 +55,19 @@ NEW_BLOCK = """\
         except Exception as e:
             logging.exception("PIPELINE_ERROR in run_job_pipeline")
             job_id = "UNKNOWN"
-            final_text = f"PIPELINE_ERROR: {e}"
+            final_text = f"Ошибка обработки: {e}"
+
+        # Guard against empty messages — NEVER send empty text to Telegram
+        if not final_text:
+            final_text = "Не удалось сформировать ответ. Попробуйте переформулировать запрос."
 
         # Safe send: plain text, chunked
         payload = (final_text + f"\\n\\njob: {job_id}").strip()
         max_len = 3900
-        parts = [payload[i:i+max_len] for i in range(0, len(payload), max_len)] or ["job: " + job_id]
+        parts = [payload[i:i+max_len] for i in range(0, len(payload), max_len)] or [payload]
         for part in parts:
+            if not part.strip():
+                continue
             try:
                 await event.answer(part)
             except Exception as e:

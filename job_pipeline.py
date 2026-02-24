@@ -300,7 +300,49 @@ def _claude_call(role: RoleCfg, prompt: str, session_id: str) -> Dict[str, Any]:
     payload["duration_sec"] = dur
     payload["model"] = role.model
     payload["role"] = role.key
+
+    # Detect empty result even with exit_code 0 — Claude may return success
+    # but produce no useful output (common cause of empty bot messages)
+    if proc.returncode == 0 and not payload.get("result", "").strip() and not err:
+        payload["_warning"] = "empty_result_on_success"
+
     return payload
+
+
+def _verify_files_written(job_dir: Path, file_names: List[str]) -> Optional[str]:
+    """Check that expected files were written and are non-empty.
+    Returns error message if any file is missing/empty, or None if all OK."""
+    missing = []
+    for fn in file_names:
+        content = _read_text(job_dir / fn).strip()
+        if not content:
+            missing.append(fn)
+    if missing:
+        return f"Files not written by Claude: {', '.join(missing)}"
+    return None
+
+
+def _collect_fallback_answer(job_dir: Path, job_id: str, stages: List[str]) -> str:
+    """When 7_done.md is empty, collect useful info from other pipeline files."""
+    parts = [f"Pipeline завершён, но финальный ответ не сформирован (job: {job_id})."]
+
+    understanding = _read_text(job_dir / "1_understanding.md").strip()
+    if understanding:
+        # Trim to first 500 chars to avoid huge messages
+        parts.append(f"\n📋 Понимание задачи:\n{understanding[:500]}")
+
+    research = _read_text(job_dir / "2_research.md").strip()
+    if research:
+        parts.append(f"\n🔍 Исследование:\n{research[:500]}")
+
+    draft = _read_text(job_dir / "5_execution" / "outputs" / "draft_answer.md").strip()
+    if draft:
+        parts.append(f"\n📝 Черновик ответа:\n{draft[:1000]}")
+
+    if stages:
+        parts.append(f"\nСтадии: {' → '.join(stages)}")
+
+    return "\n".join(parts)
 
 
 # -----------------------
@@ -410,18 +452,27 @@ def run_job_pipeline(chat_id: int, user_text: str) -> Dict[str, Any]:
         })
 
         if r.get("exit_code") != 0:
-            msg = f"ORCH_FAIL: {r.get('stderr') or r.get('result') or 'unknown'}"
+            msg = f"Ошибка оркестратора: {r.get('stderr') or r.get('result') or 'неизвестная ошибка'}"
             _write_text(job_dir / "7_done.md", msg + "\n")
             return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_FAIL"]}
 
+        # Validate orchestrator actually wrote required files
+        orch_err = _verify_files_written(job_dir, ["1_understanding.md", "4_orchestrator_plan.json"])
+        if orch_err:
+            # Orchestrator returned exit_code 0 but didn't write files — this is the
+            # root cause of empty bot messages. Return Claude's raw result as fallback.
+            claude_text = (r.get("result") or "").strip()
+            if claude_text:
+                msg = claude_text
+            else:
+                msg = f"Оркестратор не создал план. {orch_err}"
+            _write_text(job_dir / "7_done.md", msg + "\n")
+            _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "ORCH_NO_FILES",
+                                      "role": "system", "action": "orch_files_missing", "error": orch_err})
+            return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_NO_FILES"]}
+
         # Smoke mode: stop after plan exists
         if os.getenv("PIPELINE_SMOKE", "0") == "1":
-            # validate that files were written
-            if not _read_text(job_dir / "1_understanding.md").strip():
-                raise RuntimeError("smoke_fail: 1_understanding.md is empty")
-            if not _read_text(job_dir / "4_orchestrator_plan.json").strip():
-                raise RuntimeError("smoke_fail: 4_orchestrator_plan.json is empty")
-
             final = "SMOKE_OK: understanding+plan generated"
             _write_text(job_dir / "7_done.md", final + "\n")
             _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "SMOKE_STOP", "role": "system", "action": "stop_after_plan"})
@@ -465,24 +516,29 @@ def run_job_pipeline(chat_id: int, user_text: str) -> Dict[str, Any]:
             })
 
             if not ok:
-                msg = f"TASK_FAIL[{t.get('task_id')}:{role.key}]: {rr.get('stderr') or rr.get('result') or 'unknown'}"
+                claude_text = (rr.get("result") or "").strip()
+                msg = claude_text if claude_text else (
+                    f"Задача {t.get('task_id')} ({role.key}) завершилась с ошибкой: "
+                    f"{rr.get('stderr') or 'неизвестная ошибка'}"
+                )
                 _write_text(job_dir / "7_done.md", msg + "\n")
                 return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": stages}
 
         final_answer = _read_text(job_dir / "7_done.md").strip()
         if not final_answer:
-            final_answer = "DONE_BUT_EMPTY: 7_done.md is empty"
+            # 7_done.md is empty — collect whatever useful info we have
+            final_answer = _collect_fallback_answer(job_dir, job_id, stages)
             _write_text(job_dir / "7_done.md", final_answer + "\n")
 
         return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": final_answer, "stages": stages}
 
     except subprocess.TimeoutExpired as e:
-        msg = f"TIMEOUT: {e}"
+        msg = f"Превышено время ожидания ({e.timeout}с). Попробуйте упростить запрос."
         _write_text(job_dir / "7_done.md", msg + "\n")
-        _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "TIMEOUT", "role": "system", "action": "exception", "error": msg})
+        _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "TIMEOUT", "role": "system", "action": "exception", "error": str(e)})
         return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["TIMEOUT"]}
     except Exception as e:
-        msg = f"PIPELINE_ERROR: {type(e).__name__}: {e}"
+        msg = f"Ошибка pipeline: {type(e).__name__}: {e}"
         _write_text(job_dir / "7_done.md", msg + "\n")
-        _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "ERROR", "role": "system", "action": "exception", "error": msg})
+        _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "ERROR", "role": "system", "action": "exception", "error": str(e)})
         return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ERROR"]}

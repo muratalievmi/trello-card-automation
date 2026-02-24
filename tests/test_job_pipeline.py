@@ -233,6 +233,30 @@ class TestClaudeCall:
         assert "--session-id" in cmd
         assert cmd[cmd.index("--session-id") + 1] == "sid-123"
 
+    @patch("job_pipeline.subprocess.run")
+    def test_empty_result_warning(self, mock_run):
+        """exit_code=0 но пустой result → добавляется _warning."""
+        mock_run.return_value = MagicMock(
+            stdout=json.dumps({"result": ""}),
+            stderr="",
+            returncode=0,
+        )
+        role = self._make_role()
+        result = jp._claude_call(role, "test", "s1")
+        assert result.get("_warning") == "empty_result_on_success"
+
+    @patch("job_pipeline.subprocess.run")
+    def test_no_warning_when_result_present(self, mock_run):
+        """exit_code=0 и есть result → нет _warning."""
+        mock_run.return_value = MagicMock(
+            stdout=json.dumps({"result": "some text"}),
+            stderr="",
+            returncode=0,
+        )
+        role = self._make_role()
+        result = jp._claude_call(role, "test", "s1")
+        assert "_warning" not in result
+
 
 # =========================================
 # Prompts
@@ -288,8 +312,35 @@ class TestRunJobPipeline:
             "duration_sec": 1.0, "model": "m", "role": "orchestrator",
         }
         result = jp.run_job_pipeline(111, "test")
-        assert "ORCH_FAIL" in result["final_answer"]
         assert "ORCH_FAIL" in result["stages"]
+        # New: human-readable error message
+        assert "orch error" in result["final_answer"]
+
+    @patch("job_pipeline._claude_call")
+    def test_orchestrator_success_but_no_files(self, mock_call, tmp_dirs, monkeypatch):
+        """Ключевой тест: orchestrator вернул exit_code=0 но не записал файлы.
+        Это корневая причина пустых сообщений бота."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+        mock_call.return_value = {
+            "result": "I thought about it", "exit_code": 0, "stderr": "",
+            "duration_sec": 1.0, "model": "m", "role": "orchestrator",
+        }
+        result = jp.run_job_pipeline(111, "test")
+        # Should NOT return empty — should return Claude's raw text as fallback
+        assert result["final_answer"] == "I thought about it"
+        assert "ORCH_NO_FILES" in result["stages"]
+
+    @patch("job_pipeline._claude_call")
+    def test_orchestrator_no_files_no_result(self, mock_call, tmp_dirs, monkeypatch):
+        """Orchestrator exit=0, no files, no result text → descriptive error."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+        mock_call.return_value = {
+            "result": "", "exit_code": 0, "stderr": "",
+            "duration_sec": 1.0, "model": "m", "role": "orchestrator",
+        }
+        result = jp.run_job_pipeline(111, "test")
+        assert "Оркестратор не создал план" in result["final_answer"]
+        assert "ORCH_NO_FILES" in result["stages"]
 
     @patch("job_pipeline._claude_call")
     def test_smoke_mode(self, mock_call, tmp_dirs, monkeypatch):
@@ -319,10 +370,9 @@ class TestRunJobPipeline:
             "result": "ok", "exit_code": 0, "stderr": "",
             "duration_sec": 1.0, "model": "m", "role": "orchestrator",
         }
-        # orchestrator не записал файлы → smoke должен вернуть ошибку
+        # orchestrator не записал файлы → ORCH_NO_FILES (файлы проверяются до smoke)
         result = jp.run_job_pipeline(111, "test")
-        assert "PIPELINE_ERROR" in result["final_answer"]
-        assert "ERROR" in result["stages"]
+        assert "ORCH_NO_FILES" in result["stages"]
 
     @patch("job_pipeline._claude_call")
     def test_full_pipeline_success(self, mock_call, tmp_dirs, monkeypatch):
@@ -387,7 +437,8 @@ class TestRunJobPipeline:
 
         mock_call.side_effect = fake_claude
         result = jp.run_job_pipeline(111, "will fail")
-        assert "TASK_FAIL" in result["final_answer"]
+        # Task failure produces human-readable error with role and error text
+        assert "researcher" in result["final_answer"] or "research failed" in result["final_answer"]
         # critic should NOT have been called
         assert mock_call.call_count == 2  # orch + researcher only
 
@@ -406,21 +457,21 @@ class TestRunJobPipeline:
 
         mock_call.side_effect = fake_claude
         result = jp.run_job_pipeline(111, "unknown role")
-        assert "PIPELINE_ERROR" in result["final_answer"]
         assert "unknown_role_in_plan" in result["final_answer"]
+        assert "ERROR" in result["stages"]
 
     @patch("job_pipeline._claude_call")
     def test_timeout_handled(self, mock_call, tmp_dirs):
         mock_call.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=240)
         result = jp.run_job_pipeline(111, "timeout test")
-        assert "TIMEOUT" in result["final_answer"]
+        assert "Превышено время" in result["final_answer"]
         assert "TIMEOUT" in result["stages"]
 
     @patch("job_pipeline._claude_call")
     def test_unexpected_exception_handled(self, mock_call, tmp_dirs):
         mock_call.side_effect = RuntimeError("something unexpected")
         result = jp.run_job_pipeline(111, "crash test")
-        assert "PIPELINE_ERROR" in result["final_answer"]
+        assert "Ошибка pipeline" in result["final_answer"]
         assert "ERROR" in result["stages"]
 
     @patch("job_pipeline._claude_call")
@@ -491,3 +542,137 @@ class TestPlanLoad:
         (jd / "4_orchestrator_plan.json").write_text("{bad json")
         with pytest.raises(json.JSONDecodeError):
             jp._load_plan(jd)
+
+
+# =========================================
+# _verify_files_written (NEW)
+# =========================================
+
+class TestVerifyFilesWritten:
+    def test_all_files_present(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "a.md").write_text("content")
+        (jd / "b.md").write_text("content")
+        assert jp._verify_files_written(jd, ["a.md", "b.md"]) is None
+
+    def test_missing_file(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "a.md").write_text("content")
+        err = jp._verify_files_written(jd, ["a.md", "b.md"])
+        assert err is not None
+        assert "b.md" in err
+
+    def test_empty_file_detected(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "a.md").write_text("content")
+        (jd / "b.md").write_text("")  # empty
+        err = jp._verify_files_written(jd, ["a.md", "b.md"])
+        assert err is not None
+        assert "b.md" in err
+
+    def test_whitespace_only_file_detected(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "a.md").write_text("   \n\n  ")  # whitespace only
+        err = jp._verify_files_written(jd, ["a.md"])
+        assert err is not None
+
+    def test_no_files_to_check(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        assert jp._verify_files_written(jd, []) is None
+
+
+# =========================================
+# _collect_fallback_answer (NEW)
+# =========================================
+
+class TestCollectFallbackAnswer:
+    def test_minimal_fallback(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "5_execution" / "outputs").mkdir(parents=True)
+        answer = jp._collect_fallback_answer(jd, "JOB-TEST", ["ORCH_OK"])
+        assert "JOB-TEST" in answer
+        assert "ORCH_OK" in answer
+
+    def test_fallback_includes_understanding(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "5_execution" / "outputs").mkdir(parents=True)
+        (jd / "1_understanding.md").write_text("Задача: написать скрипт")
+        answer = jp._collect_fallback_answer(jd, "JOB-TEST", [])
+        assert "Задача: написать скрипт" in answer
+
+    def test_fallback_includes_draft(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "5_execution" / "outputs").mkdir(parents=True)
+        (jd / "5_execution" / "outputs" / "draft_answer.md").write_text("Вот черновик ответа")
+        answer = jp._collect_fallback_answer(jd, "JOB-TEST", [])
+        assert "Вот черновик ответа" in answer
+
+    def test_fallback_truncates_long_text(self, tmp_dirs):
+        jd = tmp_dirs["jobs"] / "JOB-TEST"
+        jd.mkdir()
+        (jd / "5_execution" / "outputs").mkdir(parents=True)
+        (jd / "1_understanding.md").write_text("A" * 2000)
+        answer = jp._collect_fallback_answer(jd, "JOB-TEST", [])
+        # Understanding truncated to 500 chars
+        assert len(answer) < 2000
+
+
+# =========================================
+# Pipeline: fallback when 7_done.md empty (NEW)
+# =========================================
+
+class TestPipelineFallbackAnswer:
+    @patch("job_pipeline._claude_call")
+    def test_empty_done_uses_fallback(self, mock_call, tmp_dirs, monkeypatch):
+        """Когда orchestrator_finalize не записал 7_done.md, pipeline
+        должен вернуть fallback-ответ вместо пустого сообщения."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+
+        def fake_claude(role, prompt, sid):
+            job_dirs = sorted(tmp_dirs["jobs"].iterdir())
+            jd = job_dirs[0]
+            if role.key == "orchestrator":
+                (jd / "1_understanding.md").write_text("Нужно сделать X")
+                plan = {
+                    "tasks": [
+                        {"task_id": "T1", "role": "orchestrator_finalize", "inputs": [], "outputs": []},
+                    ],
+                }
+                (jd / "4_orchestrator_plan.json").write_text(json.dumps(plan))
+            # orchestrator_finalize does NOT write 7_done.md
+            return {"result": "ok", "exit_code": 0, "stderr": "", "duration_sec": 1.0, "model": "m", "role": role.key}
+
+        mock_call.side_effect = fake_claude
+        result = jp.run_job_pipeline(111, "fallback test")
+
+        # Should NOT be empty or "DONE_BUT_EMPTY"
+        assert result["final_answer"] != ""
+        assert "DONE_BUT_EMPTY" not in result["final_answer"]
+        # Should contain useful info from understanding
+        assert "Нужно сделать X" in result["final_answer"]
+
+    @patch("job_pipeline._claude_call")
+    def test_final_answer_never_empty(self, mock_call, tmp_dirs, monkeypatch):
+        """Pipeline NEVER returns empty final_answer — any path."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+
+        def fake_claude(role, prompt, sid):
+            job_dirs = sorted(tmp_dirs["jobs"].iterdir())
+            jd = job_dirs[0]
+            if role.key == "orchestrator":
+                (jd / "1_understanding.md").write_text("ok")
+                plan = {"tasks": [{"task_id": "T1", "role": "orchestrator_finalize", "inputs": [], "outputs": []}]}
+                (jd / "4_orchestrator_plan.json").write_text(json.dumps(plan))
+            return {"result": "", "exit_code": 0, "stderr": "", "duration_sec": 1.0, "model": "m", "role": role.key}
+
+        mock_call.side_effect = fake_claude
+        result = jp.run_job_pipeline(111, "empty test")
+        assert result["final_answer"].strip() != ""
