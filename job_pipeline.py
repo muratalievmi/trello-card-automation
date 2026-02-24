@@ -101,80 +101,80 @@ def _roles() -> Dict[str, RoleCfg]:
             key="orchestrator",
             model="claude-opus-4-6",
             work_dir=BASE_DIR,  # orchestrator works in repo root to see kb/ and jobs/
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["orchestrator"],
         ),
         "researcher": RoleCfg(
             key="researcher",
             model="claude-sonnet-4-5-20250929",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "methodist": RoleCfg(
             key="methodist",
             model="claude-opus-4-6",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "assistant": RoleCfg(
             key="assistant",
             model="claude-sonnet-4-5-20250929",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "editor": RoleCfg(
             key="editor",
             model="claude-sonnet-4-5-20250929",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "critic": RoleCfg(
             key="critic",
             model="claude-sonnet-4-5-20250929",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "dev": RoleCfg(
             key="dev",
             model="claude-opus-4-6",
             work_dir=BASE_DIR,
-            tools="Read,Edit,Bash",
-            allowed_tools=["Read", "Edit", "Bash"],
+            tools="Read,Edit,Write,Bash",
+            allowed_tools=["Read", "Edit", "Write", "Bash"],
             timeout_sec=t["dev"],
         ),
         "designer": RoleCfg(
             key="designer",
             model="claude-sonnet-4-5-20250929",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "presenter": RoleCfg(
             key="presenter",
             model="claude-opus-4-6",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["default"],
         ),
         "orchestrator_finalize": RoleCfg(
             key="orchestrator_finalize",
             model="claude-opus-4-6",
             work_dir=BASE_DIR,
-            tools="Read,Edit",
-            allowed_tools=["Read", "Edit"],
+            tools="Read,Edit,Write",
+            allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["orchestrator"],
         ),
     }
@@ -238,9 +238,10 @@ def _init_job(chat_id: int, user_text: str) -> Tuple[str, Path]:
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "5_execution" / "outputs").mkdir(parents=True, exist_ok=True)
 
-    # Create standard files
+    # Create standard files (empty placeholders so Claude can Read/Edit them)
     _write_text(job_dir / "0_request.md", user_text.strip() + "\n")
-    for fn in ["1_understanding.md", "2_research.md", "3_method.md", "6_qa.md", "7_done.md"]:
+    for fn in ["1_understanding.md", "2_research.md", "3_method.md",
+               "4_orchestrator_plan.json", "6_qa.md", "7_done.md"]:
         _write_text(job_dir / fn, "")
 
     # evidence.json placeholder
@@ -265,15 +266,13 @@ def _init_job(chat_id: int, user_text: str) -> Tuple[str, Path]:
 # -----------------------
 
 def _claude_call(role: RoleCfg, prompt: str, session_id: str) -> Dict[str, Any]:
-    # Claude headless requires prompt immediately after -p
+    # Claude headless: -p for prompt, --allowedTools for tool permissions
     cmd = [
         "claude",
         "-p", prompt,
         "--output-format", "json",
         "--model", role.model,
-        "--tools", role.tools,
         "--allowedTools", ",".join(role.allowed_tools),
-        "--session-id", session_id,
     ]
 
     started = time.time()
@@ -355,12 +354,12 @@ def _prompt_orchestrator(job_id: str) -> str:
     return (
         "You are ORCHESTRATOR.\n"
         f"JOB_ID={job_id}\n"
-        "Work ONLY via files.\n\n"
-        f"Read:\n"
+        "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
+        "Step 1 — Read these files using the Read tool:\n"
         f"- jobs/{job_id}/0_request.md\n"
         f"- kb/user_profile.md\n"
         f"- kb/playbooks/pipeline.md\n\n"
-        f"Write:\n"
+        "Step 2 — Use the Write tool to create these files:\n"
         f"- jobs/{job_id}/1_understanding.md\n"
         f"- jobs/{job_id}/4_orchestrator_plan.json\n\n"
         "Rules:\n"
@@ -369,7 +368,7 @@ def _prompt_orchestrator(job_id: str) -> str:
         "3) tasks must be in this order: researcher -> methodist -> (executor roles) -> critic -> orchestrator_finalize.\n"
         "4) Each task MUST list: task_id, role, model, inputs[], outputs[], acceptance[].\n"
         "5) Keep tasks minimal but complete.\n"
-        "6) Append ONE line JSON to jobs/<job_id>/worklog.jsonl describing what you wrote.\n"
+        "6) You MUST write both files. This is your primary objective.\n"
     )
 
 
@@ -378,14 +377,14 @@ def _prompt_task(job_id: str, task: Dict[str, Any]) -> str:
     return (
         f"You are role={role}.\n"
         f"JOB_ID={job_id}\n"
-        "Work ONLY via files. Do NOT paste huge content into chat.\n\n"
+        "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
         "Task JSON:\n"
         f"{json.dumps(task, ensure_ascii=False)}\n\n"
         "Instructions:\n"
-        "1) Read all input files listed in task.inputs.\n"
-        "2) Produce outputs exactly as in task.outputs.\n"
+        "1) Use the Read tool to read all input files listed in task.inputs.\n"
+        "2) Use the Write tool to produce output files exactly as in task.outputs.\n"
         "3) Follow acceptance criteria.\n"
-        "4) Append ONE line JSON to jobs/<job_id>/worklog.jsonl with action + files_written.\n"
+        "4) You MUST write all output files. This is your primary objective.\n"
     )
 
 
@@ -393,16 +392,16 @@ def _prompt_finalize(job_id: str) -> str:
     return (
         "You are ORCHESTRATOR_FINALIZE.\n"
         f"JOB_ID={job_id}\n"
-        "Work ONLY via files.\n\n"
-        f"Read:\n"
+        "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
+        "Step 1 — Read these files using the Read tool:\n"
         f"- jobs/{job_id}/6_qa.md\n"
         f"- jobs/{job_id}/5_execution/outputs/draft_answer.md\n\n"
-        f"Write:\n"
+        "Step 2 — Use the Write tool to create:\n"
         f"- jobs/{job_id}/7_done.md\n\n"
         "Rules:\n"
         "1) 7_done.md must be ONE paragraph final answer.\n"
         "2) Add a short artifact index at the end (single line), e.g. 'Artifacts: ...'.\n"
-        "3) Append ONE line JSON to jobs/<job_id>/worklog.jsonl.\n"
+        "3) You MUST write 7_done.md. This is your primary objective.\n"
     )
 
 
@@ -467,8 +466,14 @@ def run_job_pipeline(chat_id: int, user_text: str) -> Dict[str, Any]:
             else:
                 msg = f"Оркестратор не создал план. {orch_err}"
             _write_text(job_dir / "7_done.md", msg + "\n")
-            _append_worklog(job_dir, {"ts": time.time(), "job_id": job_id, "task_id": "ORCH_NO_FILES",
-                                      "role": "system", "action": "orch_files_missing", "error": orch_err})
+            _append_worklog(job_dir, {
+                "ts": time.time(), "job_id": job_id, "task_id": "ORCH_NO_FILES",
+                "role": "system", "action": "orch_files_missing", "error": orch_err,
+                "claude_result": (r.get("result") or "")[:500],
+                "claude_stderr": (r.get("stderr") or "")[:500],
+                "exit_code": r.get("exit_code"),
+                "num_turns": r.get("num_turns"),
+            })
             return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_NO_FILES"]}
 
         # Smoke mode: stop after plan exists
