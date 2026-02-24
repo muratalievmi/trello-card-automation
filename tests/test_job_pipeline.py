@@ -123,7 +123,7 @@ class TestJobInit:
         assert job_dir.exists()
         assert (job_dir / "0_request.md").exists()
         assert (job_dir / "1_understanding.md").exists()
-        assert (job_dir / "4_orchestrator_plan.json").exists() is False  # not created by init
+        assert (job_dir / "4_orchestrator_plan.json").exists()  # created as empty placeholder
         assert (job_dir / "5_execution" / "outputs").is_dir()
         assert (job_dir / "evidence.json").exists()
         assert (job_dir / "worklog.jsonl").exists()
@@ -230,8 +230,9 @@ class TestClaudeCall:
         assert "-p" in cmd
         assert cmd[cmd.index("-p") + 1] == "my prompt"
         assert "--model" in cmd
-        assert "--session-id" in cmd
-        assert cmd[cmd.index("--session-id") + 1] == "sid-123"
+        assert "--allowedTools" in cmd
+        # --session-id was removed in a previous fix (invalid CLI flag)
+        assert "--session-id" not in cmd
 
     @patch("job_pipeline.subprocess.run")
     def test_empty_result_warning(self, mock_run):
