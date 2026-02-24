@@ -351,17 +351,18 @@ def _collect_fallback_answer(job_dir: Path, job_id: str, stages: List[str]) -> s
 def _prompt_orchestrator(job_id: str) -> str:
     # Orchestrator writes: 1_understanding.md + 4_orchestrator_plan.json
     # It must keep plan minimal, but include tasks in strict order.
+    job_dir = JOBS_DIR / job_id
+    kb_dir = KB_DIR
     return (
         "You are ORCHESTRATOR.\n"
         f"JOB_ID={job_id}\n"
         "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
-        "Step 1 — Read these files using the Read tool:\n"
-        f"- jobs/{job_id}/0_request.md\n"
-        f"- kb/user_profile.md\n"
-        f"- kb/playbooks/pipeline.md\n\n"
+        "Step 1 — Read the request file using the Read tool:\n"
+        f"- {job_dir}/0_request.md\n"
+        f"(Also try to read {kb_dir}/user_profile.md and {kb_dir}/playbooks/pipeline.md if they exist, but do NOT fail if they are missing.)\n\n"
         "Step 2 — Use the Write tool to create these files:\n"
-        f"- jobs/{job_id}/1_understanding.md\n"
-        f"- jobs/{job_id}/4_orchestrator_plan.json\n\n"
+        f"- {job_dir}/1_understanding.md\n"
+        f"- {job_dir}/4_orchestrator_plan.json\n\n"
         "Rules:\n"
         "1) 1_understanding.md: restate request, define success criteria, list assumptions.\n"
         "2) 4_orchestrator_plan.json: JSON with fields: job_id, goal, deliverables[], tasks[].\n"
@@ -374,10 +375,13 @@ def _prompt_orchestrator(job_id: str) -> str:
 
 def _prompt_task(job_id: str, task: Dict[str, Any]) -> str:
     role = task.get("role", "")
+    job_dir = JOBS_DIR / job_id
     return (
         f"You are role={role}.\n"
         f"JOB_ID={job_id}\n"
-        "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
+        f"JOB_DIR={job_dir}\n"
+        "You MUST use tools to read and write files. Do NOT just respond with text.\n"
+        "All file paths are ABSOLUTE. Use them exactly as given.\n\n"
         "Task JSON:\n"
         f"{json.dumps(task, ensure_ascii=False)}\n\n"
         "Instructions:\n"
@@ -389,15 +393,16 @@ def _prompt_task(job_id: str, task: Dict[str, Any]) -> str:
 
 
 def _prompt_finalize(job_id: str) -> str:
+    job_dir = JOBS_DIR / job_id
     return (
         "You are ORCHESTRATOR_FINALIZE.\n"
         f"JOB_ID={job_id}\n"
         "You MUST use tools to read and write files. Do NOT just respond with text.\n\n"
         "Step 1 — Read these files using the Read tool:\n"
-        f"- jobs/{job_id}/6_qa.md\n"
-        f"- jobs/{job_id}/5_execution/outputs/draft_answer.md\n\n"
+        f"- {job_dir}/6_qa.md\n"
+        f"- {job_dir}/5_execution/outputs/draft_answer.md\n\n"
         "Step 2 — Use the Write tool to create:\n"
-        f"- jobs/{job_id}/7_done.md\n\n"
+        f"- {job_dir}/7_done.md\n\n"
         "Rules:\n"
         "1) 7_done.md must be ONE paragraph final answer.\n"
         "2) Add a short artifact index at the end (single line), e.g. 'Artifacts: ...'.\n"
