@@ -72,6 +72,7 @@ class RoleCfg:
     tools: str               # Claude CLI --tools (string like "Read,Edit" or "Read,Edit,Bash")
     allowed_tools: List[str] # Claude CLI --allowedTools CSV (we will join)
     timeout_sec: int
+    max_turns: int = 10      # Claude CLI --max-turns (agentic rounds)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -104,6 +105,7 @@ def _roles() -> Dict[str, RoleCfg]:
             tools="Read,Edit,Write",
             allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["orchestrator"],
+            max_turns=15,
         ),
         "researcher": RoleCfg(
             key="researcher",
@@ -176,6 +178,7 @@ def _roles() -> Dict[str, RoleCfg]:
             tools="Read,Edit,Write",
             allowed_tools=["Read", "Edit", "Write"],
             timeout_sec=t["orchestrator"],
+            max_turns=10,
         ),
     }
 
@@ -272,6 +275,7 @@ def _claude_call(role: RoleCfg, prompt: str, session_id: str) -> Dict[str, Any]:
         "-p", prompt,
         "--output-format", "json",
         "--model", role.model,
+        "--max-turns", str(role.max_turns),
         "--allowedTools", ",".join(role.allowed_tools),
     ]
 
@@ -439,47 +443,80 @@ def run_job_pipeline(chat_id: int, user_text: str) -> Dict[str, Any]:
     try:
         roles = _roles()
 
-        # --- orchestrator step ---
+        # --- orchestrator step (with retry) ---
         orch = roles["orchestrator"]
         orch_sid = str(uuid.uuid4())
-        r = _claude_call(orch, _prompt_orchestrator(job_id), orch_sid)
+        orch_prompt = _prompt_orchestrator(job_id)
 
-        _append_worklog(job_dir, {
-            "ts": time.time(),
-            "job_id": job_id,
-            "task_id": "ORCH_UNDERSTAND_PLAN",
-            "role": orch.key,
-            "model": orch.model,
-            "action": "claude_call",
-            "ok": (r.get("exit_code") == 0),
-            "duration_sec": r.get("duration_sec"),
-        })
+        ORCH_MAX_ATTEMPTS = 2
+        orch_ok = False
 
-        if r.get("exit_code") != 0:
-            msg = f"Ошибка оркестратора: {r.get('stderr') or r.get('result') or 'неизвестная ошибка'}"
-            _write_text(job_dir / "7_done.md", msg + "\n")
-            return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_FAIL"]}
+        for attempt in range(1, ORCH_MAX_ATTEMPTS + 1):
+            r = _claude_call(orch, orch_prompt, orch_sid)
 
-        # Validate orchestrator actually wrote required files
-        orch_err = _verify_files_written(job_dir, ["1_understanding.md", "4_orchestrator_plan.json"])
-        if orch_err:
-            # Orchestrator returned exit_code 0 but didn't write files — this is the
-            # root cause of empty bot messages. Return Claude's raw result as fallback.
-            claude_text = (r.get("result") or "").strip()
-            if claude_text:
-                msg = claude_text
-            else:
-                msg = f"Оркестратор не создал план. {orch_err}"
-            _write_text(job_dir / "7_done.md", msg + "\n")
             _append_worklog(job_dir, {
-                "ts": time.time(), "job_id": job_id, "task_id": "ORCH_NO_FILES",
-                "role": "system", "action": "orch_files_missing", "error": orch_err,
-                "claude_result": (r.get("result") or "")[:500],
-                "claude_stderr": (r.get("stderr") or "")[:500],
-                "exit_code": r.get("exit_code"),
+                "ts": time.time(),
+                "job_id": job_id,
+                "task_id": "ORCH_UNDERSTAND_PLAN",
+                "role": orch.key,
+                "model": orch.model,
+                "action": "claude_call",
+                "ok": (r.get("exit_code") == 0),
+                "duration_sec": r.get("duration_sec"),
+                "attempt": attempt,
                 "num_turns": r.get("num_turns"),
+                "raw_stdout_len": len(r.get("result") or ""),
+                "raw_stderr_len": len(r.get("stderr") or ""),
             })
-            return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_NO_FILES"]}
+
+            if r.get("exit_code") != 0:
+                if attempt < ORCH_MAX_ATTEMPTS:
+                    _append_worklog(job_dir, {
+                        "ts": time.time(), "job_id": job_id, "task_id": "ORCH_RETRY",
+                        "role": "system", "action": "retry_after_fail",
+                        "attempt": attempt, "error": r.get("stderr", "")[:500],
+                    })
+                    time.sleep(3)
+                    continue
+                msg = f"Ошибка оркестратора: {r.get('stderr') or r.get('result') or 'неизвестная ошибка'}"
+                _write_text(job_dir / "7_done.md", msg + "\n")
+                return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_FAIL"]}
+
+            # Validate orchestrator actually wrote required files
+            orch_err = _verify_files_written(job_dir, ["1_understanding.md", "4_orchestrator_plan.json"])
+            if orch_err:
+                if attempt < ORCH_MAX_ATTEMPTS:
+                    _append_worklog(job_dir, {
+                        "ts": time.time(), "job_id": job_id, "task_id": "ORCH_RETRY",
+                        "role": "system", "action": "retry_after_empty_files",
+                        "attempt": attempt, "error": orch_err,
+                        "claude_result": (r.get("result") or "")[:500],
+                        "claude_stderr": (r.get("stderr") or "")[:500],
+                    })
+                    time.sleep(3)
+                    continue
+                # Final attempt also failed — return error
+                claude_text = (r.get("result") or "").strip()
+                if claude_text:
+                    msg = claude_text
+                else:
+                    msg = f"Оркестратор не создал план. {orch_err}"
+                _write_text(job_dir / "7_done.md", msg + "\n")
+                _append_worklog(job_dir, {
+                    "ts": time.time(), "job_id": job_id, "task_id": "ORCH_NO_FILES",
+                    "role": "system", "action": "orch_files_missing", "error": orch_err,
+                    "claude_result": (r.get("result") or "")[:500],
+                    "claude_stderr": (r.get("stderr") or "")[:500],
+                    "exit_code": r.get("exit_code"),
+                    "num_turns": r.get("num_turns"),
+                })
+                return {"job_id": job_id, "job_dir": str(job_dir), "final_answer": msg, "stages": ["ORCH_NO_FILES"]}
+
+            # Both files written successfully
+            orch_ok = True
+            break
+
+        assert orch_ok, "orchestrator loop ended without success or return"
 
         # Smoke mode: stop after plan exists
         if os.getenv("PIPELINE_SMOKE", "0") == "1":

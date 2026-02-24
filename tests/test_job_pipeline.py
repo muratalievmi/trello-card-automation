@@ -66,6 +66,16 @@ class TestPipelineRoles:
             assert "Read" in cfg.allowed_tools, f"{key}: missing Read"
             assert "Edit" in cfg.allowed_tools, f"{key}: missing Edit"
 
+    def test_orchestrator_has_high_max_turns(self):
+        r = jp._roles()
+        assert r["orchestrator"].max_turns >= 10
+        assert r["orchestrator_finalize"].max_turns >= 5
+
+    def test_default_max_turns(self):
+        r = jp._roles()
+        # Roles without explicit max_turns should have the default (10)
+        assert r["researcher"].max_turns == 10
+
     def test_role_aliases(self):
         assert jp.ROLE_ALIASES["methodologist"] == "methodist"
         assert jp.ROLE_ALIASES["ontologist"] == "methodist"
@@ -171,6 +181,7 @@ class TestClaudeCall:
             tools="Read,Edit",
             allowed_tools=["Read", "Edit"],
             timeout_sec=60,
+            max_turns=10,
         )
 
     @patch("job_pipeline.subprocess.run")
@@ -231,6 +242,8 @@ class TestClaudeCall:
         assert cmd[cmd.index("-p") + 1] == "my prompt"
         assert "--model" in cmd
         assert "--allowedTools" in cmd
+        assert "--max-turns" in cmd
+        assert cmd[cmd.index("--max-turns") + 1] == "10"
         # --session-id was removed in a previous fix (invalid CLI flag)
         assert "--session-id" not in cmd
 
@@ -306,21 +319,25 @@ class TestRunJobPipeline:
         assert result["final_answer"] == "Pipeline disabled."
         mock_call.assert_not_called()
 
+    @patch("job_pipeline.time.sleep")
     @patch("job_pipeline._claude_call")
-    def test_orchestrator_failure(self, mock_call, tmp_dirs):
+    def test_orchestrator_failure(self, mock_call, mock_sleep, tmp_dirs):
         mock_call.return_value = {
             "result": "", "exit_code": 1, "stderr": "orch error",
             "duration_sec": 1.0, "model": "m", "role": "orchestrator",
         }
         result = jp.run_job_pipeline(111, "test")
         assert "ORCH_FAIL" in result["stages"]
-        # New: human-readable error message
+        # Human-readable error message
         assert "orch error" in result["final_answer"]
+        # Should have retried (2 attempts)
+        assert mock_call.call_count == 2
 
+    @patch("job_pipeline.time.sleep")
     @patch("job_pipeline._claude_call")
-    def test_orchestrator_success_but_no_files(self, mock_call, tmp_dirs, monkeypatch):
+    def test_orchestrator_success_but_no_files(self, mock_call, mock_sleep, tmp_dirs, monkeypatch):
         """Ключевой тест: orchestrator вернул exit_code=0 но не записал файлы.
-        Это корневая причина пустых сообщений бота."""
+        Это корневая причина пустых сообщений бота. Now retries once before failing."""
         monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
         mock_call.return_value = {
             "result": "I thought about it", "exit_code": 0, "stderr": "",
@@ -330,10 +347,12 @@ class TestRunJobPipeline:
         # Should NOT return empty — should return Claude's raw text as fallback
         assert result["final_answer"] == "I thought about it"
         assert "ORCH_NO_FILES" in result["stages"]
+        # Should have retried (2 attempts)
+        assert mock_call.call_count == 2
 
     @patch("job_pipeline._claude_call")
     def test_orchestrator_no_files_no_result(self, mock_call, tmp_dirs, monkeypatch):
-        """Orchestrator exit=0, no files, no result text → descriptive error."""
+        """Orchestrator exit=0, no files, no result text → descriptive error after retry."""
         monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
         mock_call.return_value = {
             "result": "", "exit_code": 0, "stderr": "",
@@ -342,6 +361,50 @@ class TestRunJobPipeline:
         result = jp.run_job_pipeline(111, "test")
         assert "Оркестратор не создал план" in result["final_answer"]
         assert "ORCH_NO_FILES" in result["stages"]
+        # Should have retried (2 attempts)
+        assert mock_call.call_count == 2
+
+    @patch("job_pipeline.time.sleep")
+    @patch("job_pipeline._claude_call")
+    def test_orchestrator_retry_succeeds_on_second_attempt(self, mock_call, mock_sleep, tmp_dirs, monkeypatch):
+        """Orchestrator fails first attempt but succeeds on retry."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+        monkeypatch.setenv("PIPELINE_SMOKE", "1")
+
+        call_count = [0]
+
+        def fake_claude(role, prompt, sid):
+            call_count[0] += 1
+            job_dirs = sorted(tmp_dirs["jobs"].iterdir())
+            jd = job_dirs[0]
+            if call_count[0] == 1:
+                # First attempt: don't write files
+                return {"result": "", "exit_code": 0, "stderr": "", "duration_sec": 1.0, "model": "m", "role": "orchestrator"}
+            else:
+                # Second attempt: write files
+                (jd / "1_understanding.md").write_text("understood")
+                (jd / "4_orchestrator_plan.json").write_text(json.dumps({"tasks": []}))
+                return {"result": "ok", "exit_code": 0, "stderr": "", "duration_sec": 1.0, "model": "m", "role": "orchestrator"}
+
+        mock_call.side_effect = fake_claude
+        result = jp.run_job_pipeline(111, "retry test")
+        assert "SMOKE_OK" in result["final_answer"]
+        assert call_count[0] == 2
+        mock_sleep.assert_called_once_with(3)
+
+    @patch("job_pipeline.time.sleep")
+    @patch("job_pipeline._claude_call")
+    def test_orchestrator_retry_on_exit_code_failure(self, mock_call, mock_sleep, tmp_dirs, monkeypatch):
+        """Orchestrator returns non-zero exit_code, retries once, then fails."""
+        monkeypatch.delenv("PIPELINE_SMOKE", raising=False)
+        mock_call.return_value = {
+            "result": "", "exit_code": 1, "stderr": "API error",
+            "duration_sec": 1.0, "model": "m", "role": "orchestrator",
+        }
+        result = jp.run_job_pipeline(111, "exit code fail")
+        assert "ORCH_FAIL" in result["stages"]
+        assert mock_call.call_count == 2
+        mock_sleep.assert_called_once_with(3)
 
     @patch("job_pipeline._claude_call")
     def test_smoke_mode(self, mock_call, tmp_dirs, monkeypatch):
@@ -364,16 +427,18 @@ class TestRunJobPipeline:
         assert "SMOKE_OK" in result["final_answer"]
         assert "SMOKE_STOP" in result["stages"]
 
+    @patch("job_pipeline.time.sleep")
     @patch("job_pipeline._claude_call")
-    def test_smoke_mode_fails_on_empty_understanding(self, mock_call, tmp_dirs, monkeypatch):
+    def test_smoke_mode_fails_on_empty_understanding(self, mock_call, mock_sleep, tmp_dirs, monkeypatch):
         monkeypatch.setenv("PIPELINE_SMOKE", "1")
         mock_call.return_value = {
             "result": "ok", "exit_code": 0, "stderr": "",
             "duration_sec": 1.0, "model": "m", "role": "orchestrator",
         }
-        # orchestrator не записал файлы → ORCH_NO_FILES (файлы проверяются до smoke)
+        # orchestrator не записал файлы → ORCH_NO_FILES (файлы проверяются до smoke, retries exhausted)
         result = jp.run_job_pipeline(111, "test")
         assert "ORCH_NO_FILES" in result["stages"]
+        assert mock_call.call_count == 2
 
     @patch("job_pipeline._claude_call")
     def test_full_pipeline_success(self, mock_call, tmp_dirs, monkeypatch):
