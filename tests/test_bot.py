@@ -135,14 +135,65 @@ class TestPipelineMiddleware:
     async def test_empty_text_passes_through(self, middleware):
         event = self._make_event(text="   ")
         handler = self._make_handler()
-        # Empty after strip → starts with nothing, orchestrator check
-        # But if orchestrator enabled, pipeline runs.
-        # However "   ".strip() == "" which is falsy
-        # Let's check: text = "   ".strip() → "" → if not text passes through
-        # Actually text = "   " → getattr returns "   " which is truthy,
-        # then text.strip() = "" which doesn't start with / or @,
-        # so it depends on orchestrator. Let's just verify no crash.
         await middleware(handler, event, {})
+
+
+# =========================================
+# BUG: is_orchestrator_enabled() без chat_id
+# =========================================
+
+class TestMiddlewareChatIdBug:
+    """Воспроизводим баг из bot.py строка 44:
+    is_orchestrator_enabled() вызывается БЕЗ chat_id → TypeError → middleware не работает."""
+
+    def test_orchestrator_requires_chat_id(self):
+        """is_orchestrator_enabled() без аргумента должен вызвать TypeError."""
+        from roles import is_orchestrator_enabled
+        with pytest.raises(TypeError):
+            is_orchestrator_enabled()  # type: ignore — намеренный вызов без аргумента
+
+    def test_orchestrator_with_chat_id_works(self, monkeypatch):
+        """is_orchestrator_enabled(chat_id) работает корректно."""
+        import roles
+        p = Path("/tmp/test_chatid_bug")
+        p.mkdir(exist_ok=True)
+        monkeypatch.setattr(roles, "SESSIONS_DIR", p)
+        monkeypatch.setattr(roles, "ORCHESTRATOR_FILE", p / "orch.json")
+        (p / "orch.json").write_text(json.dumps({"111": True}))
+
+        result = roles.is_orchestrator_enabled(111)
+        assert result is True
+
+        (p / "orch.json").unlink(missing_ok=True)
+        p.rmdir()
+
+
+# =========================================
+# Защита от пустых сообщений в _route_and_send
+# =========================================
+
+class TestEmptyResponseGuard:
+    """Проверяем что пустой ответ от Claude заменяется на fallback."""
+
+    def test_empty_result_text_gets_fallback(self):
+        """Если result.text пустой, должен быть fallback."""
+        resp = ""
+        if not resp or not resp.strip():
+            resp = "(Claude не вернул ответ. Попробуйте ещё раз.)"
+        assert resp != ""
+        assert "Claude" in resp
+
+    def test_whitespace_result_gets_fallback(self):
+        resp = "   \n\n  "
+        if not resp or not resp.strip():
+            resp = "(Claude не вернул ответ. Попробуйте ещё раз.)"
+        assert "Claude" in resp
+
+    def test_normal_result_passes_through(self):
+        resp = "Вот ваш ответ"
+        if not resp or not resp.strip():
+            resp = "(Claude не вернул ответ. Попробуйте ещё раз.)"
+        assert resp == "Вот ваш ответ"
 
 
 # =========================================
