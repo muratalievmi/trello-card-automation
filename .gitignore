@@ -15,6 +15,7 @@ __pycache__/
 patch*.py
 fix-*.py
 diagnose_*.py
+tests/test_fix_*.py
 
 # One-time fix tools
 tools/fix_*.py
