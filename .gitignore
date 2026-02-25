@@ -5,3 +5,24 @@ dist/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Backups
+*.bak
+*.bak.*
+*.bak2
+
+# One-time patches and diagnostic scripts
+patch*.py
+fix-*.py
+diagnose_*.py
+
+# One-time fix tools
+tools/fix_*.py
+tools/patch_*.py
+
+# Binary archives
+*.tar.gz
+
+# Runtime data
+jobs/
+state/
