@@ -64,21 +64,35 @@ else:
 
 
 def _win_force_foreground(hwnd):
-    """Поднять окно в foreground на Windows, обходя foreground lock.
+    """Перевести окно в foreground на Windows, обходя foreground lock.
 
-    Используем классический AutoHotkey-трюк: симулируем нажатие Alt
-    перед SetForegroundWindow, и система считает вызов инициированным
-    пользователем. Без этого Windows блокирует кражу фокуса у CS2.
+    Используем AttachThreadInput — прикрепляем поток активного окна
+    (CS2) к нашему, после чего SetForegroundWindow для нас становится
+    легитимным. В отличие от трюка с keybd_event(Alt), это НЕ генерирует
+    реального нажатия клавиши и не может мешать вводу в игре.
     """
     if not IS_WINDOWS or not hwnd:
         return
     try:
-        VK_MENU = 0x12
-        KEYEVENTF_KEYUP = 0x0002
-        _user32.keybd_event(VK_MENU, 0, 0, 0)
-        _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        _user32.SetForegroundWindow(hwnd)
-        _user32.BringWindowToTop(hwnd)
+        kernel32 = ctypes.windll.kernel32
+        current_tid = kernel32.GetCurrentThreadId()
+        fg_window = _user32.GetForegroundWindow()
+        fg_tid = 0
+        if fg_window and fg_window != hwnd:
+            fg_tid = _user32.GetWindowThreadProcessId(fg_window, None)
+
+        attached = False
+        if fg_tid and fg_tid != current_tid:
+            attached = bool(_user32.AttachThreadInput(fg_tid, current_tid, True))
+
+        try:
+            _user32.BringWindowToTop(hwnd)
+            _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            _user32.SetForegroundWindow(hwnd)
+            _user32.SetFocus(hwnd)
+        finally:
+            if attached:
+                _user32.AttachThreadInput(fg_tid, current_tid, False)
     except Exception:
         pass
 
@@ -308,8 +322,10 @@ class OverlayApp:
     def _install_global_hotkey(self):
         """Глобальный F8, работающий даже когда фокус в CS2.
 
-        suppress=True — клавиша НЕ уходит в CS2, то есть если у тебя F8
-        забинден в игре, он не сработает, пока висит оверлей.
+        БЕЗ suppress=True — с suppress на некоторых Windows-конфигурациях
+        low-level keyboard hook глушит ввод во всех приложениях сразу.
+        Пусть F8 летит и в CS2 тоже: если у тебя на F8 что-то забинжено
+        в игре — ребинди на неиспользуемую клавишу через консоль CS2.
         """
         if not HAS_KEYBOARD:
             self._append(
@@ -317,16 +333,10 @@ class OverlayApp:
                 "[keyboard не установлен — F8 будет работать только в оверлее]\n\n",
             )
             return
-        # пробуем с suppress, если система не даёт — без suppress
-        for kwargs in ({"suppress": True}, {}):
-            try:
-                keyboard.add_hotkey(
-                    "f8", lambda: self.root.after(0, self.toggle), **kwargs
-                )
-                return
-            except Exception:
-                continue
-        self._append("meta", "[глобальный F8 недоступен]\n\n")
+        try:
+            keyboard.add_hotkey("f8", lambda: self.root.after(0, self.toggle))
+        except Exception as exc:  # noqa: BLE001
+            self._append("meta", f"[глобальный F8 недоступен: {exc}]\n\n")
 
     # ---- перетаскивание --------------------------------------------------
 
