@@ -308,6 +308,10 @@ class OverlayApp:
             widget.bind("<B1-Motion>", self._drag_move)
 
         # область вывода
+        # state=NORMAL (а не DISABLED) — иначе Tk блокирует не только ввод,
+        # но и выделение текста мышью, и ничего нельзя скопировать.
+        # Редактирование глушим биндингом <Key> ниже; мигающий курсор
+        # прячем через insertwidth=0.
         self.out = tk.Text(
             self.root,
             bg=BG,
@@ -319,10 +323,11 @@ class OverlayApp:
             highlightthickness=0,
             padx=10,
             pady=8,
-            state=tk.DISABLED,
-            insertbackground=FG_ASSIST,
+            insertwidth=0,
+            cursor="xterm",
         )
         self.out.pack(fill=tk.BOTH, expand=True)
+        self.out.bind("<Key>", self._block_out_edit)
         self.out.tag_configure("user", foreground=FG_USER)
         self.out.tag_configure("assistant", foreground=FG_ASSIST)
         self.out.tag_configure("meta", foreground=FG_META)
@@ -428,16 +433,32 @@ class OverlayApp:
         self.chat.stream_reply(text, on_delta, on_done, on_error)
 
     def _append(self, tag, text):
-        self.out.configure(state=tk.NORMAL)
         self.out.insert(tk.END, text, tag)
         self.out.see(tk.END)
-        self.out.configure(state=tk.DISABLED)
+
+    def _block_out_edit(self, event):
+        """Запретить редактирование self.out, но пропустить копирование.
+
+        Пропускаем:
+          - Ctrl+C / Ctrl+Insert — копирование выделения
+          - Ctrl+A               — выделить всё
+          - движение курсора (стрелки, Home/End/PgUp/PgDn)
+        Всё остальное глушим возвратом "break".
+        """
+        ctrl = bool(event.state & 0x0004)
+        key = event.keysym.lower()
+        if ctrl and key in ("c", "a", "insert"):
+            return None
+        if key in (
+            "left", "right", "up", "down",
+            "home", "end", "prior", "next",
+        ):
+            return None
+        return "break"
 
     def reset(self):
         self.chat.reset()
-        self.out.configure(state=tk.NORMAL)
         self.out.delete("1.0", tk.END)
-        self.out.configure(state=tk.DISABLED)
         self._append("meta", "История очищена.\n\n")
 
     def toggle(self):
