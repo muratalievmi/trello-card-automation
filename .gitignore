@@ -2,3 +2,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+
+# Python artefacts (cs2-claude-console)
+__pycache__/
+*.py[cod]
+*$py.class
