@@ -311,7 +311,8 @@ class OverlayApp:
         # state=NORMAL (а не DISABLED) — иначе Tk блокирует не только ввод,
         # но и выделение текста мышью, и ничего нельзя скопировать.
         # Редактирование глушим биндингом <Key> ниже; мигающий курсор
-        # прячем через insertwidth=0.
+        # прячем через insertwidth=0. Явные bg/fg выделения — чтобы оно
+        # было видно на тёмном фоне (дефолт на Windows почти сливается).
         self.out = tk.Text(
             self.root,
             bg=BG,
@@ -325,9 +326,36 @@ class OverlayApp:
             pady=8,
             insertwidth=0,
             cursor="xterm",
+            selectbackground="#3d5a7c",
+            selectforeground="#ffffff",
+            exportselection=True,
         )
         self.out.pack(fill=tk.BOTH, expand=True)
-        self.out.bind("<Key>", self._block_out_edit)
+
+        # Блокируем редактирование, но явно включаем шорткаты копирования.
+        # Специфичные биндинги (<Control-c> и т.п.) перекрывают общий <Key>
+        # по правилам специфичности Tk в пределах одного тега.
+        self.out.bind("<Key>", lambda e: "break")
+        self.out.bind("<Control-c>", self._out_copy_selection)
+        self.out.bind("<Control-C>", self._out_copy_selection)
+        self.out.bind("<Control-Insert>", self._out_copy_selection)
+        self.out.bind("<Control-a>", self._out_select_all)
+        self.out.bind("<Control-A>", self._out_select_all)
+        self.out.bind("<Button-3>", self._show_out_ctxmenu)
+
+        # Контекстное меню по правой кнопке — как в любом нормальном текст-поле.
+        self._out_ctxmenu = tk.Menu(
+            self.root, tearoff=0, bg=BG_INPUT, fg="#ffffff",
+            activebackground="#3d5a7c", activeforeground="#ffffff",
+            borderwidth=0,
+        )
+        self._out_ctxmenu.add_command(
+            label="Копировать      Ctrl+C", command=self._out_copy_selection
+        )
+        self._out_ctxmenu.add_command(
+            label="Выделить всё    Ctrl+A", command=self._out_select_all
+        )
+
         self.out.tag_configure("user", foreground=FG_USER)
         self.out.tag_configure("assistant", foreground=FG_ASSIST)
         self.out.tag_configure("meta", foreground=FG_META)
@@ -436,25 +464,32 @@ class OverlayApp:
         self.out.insert(tk.END, text, tag)
         self.out.see(tk.END)
 
-    def _block_out_edit(self, event):
-        """Запретить редактирование self.out, но пропустить копирование.
-
-        Пропускаем:
-          - Ctrl+C / Ctrl+Insert — копирование выделения
-          - Ctrl+A               — выделить всё
-          - движение курсора (стрелки, Home/End/PgUp/PgDn)
-        Всё остальное глушим возвратом "break".
-        """
-        ctrl = bool(event.state & 0x0004)
-        key = event.keysym.lower()
-        if ctrl and key in ("c", "a", "insert"):
-            return None
-        if key in (
-            "left", "right", "up", "down",
-            "home", "end", "prior", "next",
-        ):
-            return None
+    def _out_copy_selection(self, event=None):
+        """Скопировать выделение из self.out в системный буфер обмена."""
+        try:
+            text = self.out.get(tk.SEL_FIRST, tk.SEL_LAST)
+        except tk.TclError:
+            return "break"  # ничего не выделено
+        if not text:
+            return "break"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        # update() нужен, чтобы буфер был доступен другим приложениям
+        # после закрытия/скрытия Tk-окна — иначе Windows иногда держит
+        # clipboard только пока жив владелец.
+        self.root.update()
         return "break"
+
+    def _out_select_all(self, event=None):
+        self.out.tag_remove(tk.SEL, "1.0", tk.END)
+        self.out.tag_add(tk.SEL, "1.0", tk.END)
+        return "break"
+
+    def _show_out_ctxmenu(self, event):
+        try:
+            self._out_ctxmenu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._out_ctxmenu.grab_release()
 
     def reset(self):
         self.chat.reset()
