@@ -28,12 +28,27 @@ CS2 Claude Console — полупрозрачный оверлей для общ
     Esc           Очистить поле ввода
     Ctrl+L        Очистить историю диалога
     Ctrl+Q        Выйти
+
+WORKSPACE (персональная папка ассистента)
+    Claude работает в песочнице %USERPROFILE%\claude-workspace (можно
+    переопределить через CS2_CLAUDE_WORKSPACE). В этой папке он умеет:
+        - list_directory    — смотреть содержимое
+        - read_file         — читать файлы
+        - write_file        — создавать и перезаписывать
+        - append_to_file    — дописывать в конец
+    Выйти за пределы папки Claude физически не может — все пути
+    санитизируются перед исполнением. Всё остальное в файловой системе
+    ему недоступно. Просто попроси: "запомни это в notes.md",
+    "покажи что у тебя записано", "заведи файл по Mirage" — он сам
+    вызовет нужный инструмент.
 """
 
+import json
 import os
 import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import font as tkfont
 
 try:
@@ -156,7 +171,15 @@ def _strip_caption(hwnd):
 # Можно переопределить через переменную окружения CS2_CLAUDE_MODEL.
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 MODEL = os.environ.get("CS2_CLAUDE_MODEL", DEFAULT_MODEL)
-MAX_TOKENS = int(os.environ.get("CS2_CLAUDE_MAX_TOKENS", "1024"))
+MAX_TOKENS = int(os.environ.get("CS2_CLAUDE_MAX_TOKENS", "2048"))
+MAX_AGENT_TURNS = int(os.environ.get("CS2_CLAUDE_MAX_TURNS", "8"))
+
+# Рабочая папка-песочница. Все инструменты ограничены ею — выйти нельзя.
+# Можно переопределить через CS2_CLAUDE_WORKSPACE.
+WORKSPACE = Path(
+    os.environ.get("CS2_CLAUDE_WORKSPACE", Path.home() / "claude-workspace")
+).expanduser().resolve()
+WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 WINDOW_TITLE = "CS2 Claude Console"
 WINDOW_W = 520
@@ -171,14 +194,163 @@ FG_ASSIST = "#e6e6c8"
 FG_META = "#7a7a7a"
 FG_ERR = "#ff6b6b"
 
-SYSTEM_PROMPT = (
-    "Ты — внутриигровой ассистент игрока Counter-Strike 2. Отвечай коротко, "
-    "без длинных вступлений и markdown-форматирования: оверлей показывает "
-    "plain text. Если вопрос про тактику, раскидки, смоуки, флешки, "
-    "экономику раундов, сетапы на картах — давай конкретику (карта, сторона, "
-    "позиция, прицел по ориентирам). Если вопрос не про игру — отвечай как "
-    "обычный ассистент, так же кратко. Язык ответа — тот же, что и у вопроса."
-)
+SYSTEM_PROMPT = f"""Ты — персональный ИИ-ассистент. Общаешься с пользователем через полупрозрачный оверлей поверх игры Counter-Strike 2. Пользователь может обратиться и во время матча, и в обычной Windows-сессии.
+
+ФОРМАТ ОТВЕТОВ
+- Коротко, без воды, без длинных вступлений.
+- Plain text, без markdown: оверлей не рендерит ** _ # ` и т.п.
+- Язык ответа — тот же, что у пользователя.
+
+РАБОЧАЯ ПАПКА (WORKSPACE)
+У тебя есть собственная папка-песочница: {WORKSPACE}
+Это твоё единственное хранилище. Всё остальное файловой системы тебе недоступно.
+
+ДОСТУПНЫЕ ИНСТРУМЕНТЫ
+- list_directory(path)   — посмотреть содержимое папки (path='.' = корень workspace)
+- read_file(path)        — прочитать файл
+- write_file(path, content)   — создать или перезаписать файл
+- append_to_file(path, content) — дописать в конец файла
+
+КОГДА ПОЛЬЗОВАТЬСЯ ИНСТРУМЕНТАМИ
+- Пользователь просит запомнить / записать / сохранить что-то → write_file или append_to_file.
+- Пользователь спрашивает "что я записывал про X", "у нас есть файл...", "покажи заметки" → сначала list_directory, потом read_file.
+- Новая тема или новая карта CS2 → заведи отдельный .md файл (inferno.md, mirage.md, notes.md, todo.md и т.п.).
+- НЕ спрашивай разрешения перед чтением/записью в workspace — это твоё пространство, пользователь тебя за этим и позвал.
+- После вызова инструмента КРАТКО подтверди что сделал ("Записал в notes.md"), не пересказывай весь контент.
+
+ТАКТИКА CS2
+Если вопрос про раскидки, смоуки, флешки, экономику, сетапы — давай конкретику: карта, сторона, позиция, прицел по ориентирам. Можешь параллельно сохранять полезные раскидки в workspace (например mirage-smokes.md), чтобы пользователь потом мог посмотреть."""
+
+
+# --- инструменты для Claude (песочница в WORKSPACE) ------------------------
+
+TOOLS_SCHEMA = [
+    {
+        "name": "list_directory",
+        "description": (
+            "Показать содержимое папки внутри рабочего пространства. "
+            "Используй '.' для корня workspace. Возвращает по одной строке "
+            "на элемент с префиксом 'd' (папка) или 'f' (файл)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Относительный путь внутри workspace. '.' = корень.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Прочитать текстовый файл из workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Относительный путь к файлу внутри workspace.",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": (
+            "Создать или перезаписать файл в workspace. Автоматически "
+            "создаёт недостающие родительские папки."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Относительный путь."},
+                "content": {"type": "string", "description": "Новое содержимое файла."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "append_to_file",
+        "description": (
+            "Дописать текст в конец файла в workspace. Если файла нет — "
+            "создаст. Полезно для логов, заметок, todo."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Относительный путь."},
+                "content": {"type": "string", "description": "Что дописать."},
+            },
+            "required": ["path", "content"],
+        },
+    },
+]
+
+
+def _safe_path(rel):
+    """Разрешить относительный путь в WORKSPACE, кидая ошибку если он
+    пытается уйти наружу (через .., абсолютный путь и т.п.).
+    """
+    if rel is None:
+        raise ValueError("путь не задан")
+    rel = str(rel).strip()
+    if not rel or rel in (".", "./"):
+        return WORKSPACE
+    candidate = (WORKSPACE / rel).resolve()
+    try:
+        candidate.relative_to(WORKSPACE)
+    except ValueError:
+        raise ValueError(f"путь вне workspace: {rel}")
+    return candidate
+
+
+def _execute_tool(name, args):
+    """Выполнить инструмент и вернуть строку-результат для модели."""
+    if name == "list_directory":
+        p = _safe_path(args.get("path", "."))
+        if not p.exists():
+            return f"[не найдено] {p.relative_to(WORKSPACE) if p != WORKSPACE else '.'}"
+        if not p.is_dir():
+            return f"[не папка] {p.relative_to(WORKSPACE)}"
+        items = []
+        for child in sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower())):
+            kind = "d" if child.is_dir() else "f"
+            size = "" if child.is_dir() else f"  ({child.stat().st_size}b)"
+            items.append(f"{kind} {child.name}{size}")
+        rel = "." if p == WORKSPACE else str(p.relative_to(WORKSPACE))
+        header = f"{rel}:"
+        return header + "\n" + ("\n".join(items) if items else "(пусто)")
+
+    if name == "read_file":
+        p = _safe_path(args["path"])
+        if not p.exists():
+            return f"[не найдено] {args['path']}"
+        if not p.is_file():
+            return f"[не файл] {args['path']}"
+        try:
+            return p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return f"[бинарный файл, не читается как текст] {args['path']}"
+
+    if name == "write_file":
+        p = _safe_path(args["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        content = args.get("content", "")
+        p.write_text(content, encoding="utf-8")
+        return f"[записано] {p.relative_to(WORKSPACE)} ({len(content)} символов)"
+
+    if name == "append_to_file":
+        p = _safe_path(args["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        content = args.get("content", "")
+        with p.open("a", encoding="utf-8") as f:
+            f.write(content)
+        return f"[дописано] {p.relative_to(WORKSPACE)} (+{len(content)} символов)"
+
+    raise ValueError(f"неизвестный инструмент: {name}")
 
 
 # --- логика общения с Claude ----------------------------------------------
@@ -187,40 +359,114 @@ SYSTEM_PROMPT = (
 class ClaudeChat:
     def __init__(self):
         self.client = anthropic.Anthropic()
-        self.history = []  # [{"role": "user"|"assistant", "content": str}, ...]
+        self.history = []  # [{"role": "user"|"assistant", "content": [...blocks...]}, ...]
 
-    def stream_reply(self, user_text, on_delta, on_done, on_error):
-        """Отправить сообщение и стримить ответ в колбэки.
+    def agentic_turn(self, user_text, on_text, on_tool_call, on_tool_result, on_done, on_error):
+        """Один ход пользователя → цикл: стрим текста + вызовы инструментов,
+        пока Claude не остановится на end_turn (или max_turns).
 
-        Колбэки вызываются из фонового потока — вызывающая сторона должна
-        маршрутизировать их в UI-поток через root.after.
+        Все колбэки вызываются из фонового потока. Вызывающая сторона
+        маршрутизирует их в UI-поток через root.after.
         """
         self.history.append({"role": "user", "content": user_text})
 
         def _run():
             try:
-                pieces = []
-                with self.client.messages.stream(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=[
-                        {
-                            "type": "text",
-                            "text": SYSTEM_PROMPT,
-                            "cache_control": {"type": "ephemeral"},
-                        }
-                    ],
-                    messages=self.history,
-                ) as stream:
-                    for text in stream.text_stream:
-                        pieces.append(text)
-                        on_delta(text)
-                reply = "".join(pieces)
-                self.history.append({"role": "assistant", "content": reply})
+                for turn in range(MAX_AGENT_TURNS):
+                    assistant_blocks = []
+                    current = None  # текущий content block, который собираем
+
+                    with self.client.messages.stream(
+                        model=MODEL,
+                        max_tokens=MAX_TOKENS,
+                        system=[
+                            {
+                                "type": "text",
+                                "text": SYSTEM_PROMPT,
+                                "cache_control": {"type": "ephemeral"},
+                            }
+                        ],
+                        tools=TOOLS_SCHEMA,
+                        messages=self.history,
+                    ) as stream:
+                        for event in stream:
+                            et = getattr(event, "type", None)
+                            if et == "content_block_start":
+                                cb = event.content_block
+                                if cb.type == "text":
+                                    current = {"type": "text", "text": ""}
+                                elif cb.type == "tool_use":
+                                    current = {
+                                        "type": "tool_use",
+                                        "id": cb.id,
+                                        "name": cb.name,
+                                        "_json": "",  # собирается из partial_json дельт
+                                    }
+                            elif et == "content_block_delta":
+                                d = event.delta
+                                if getattr(d, "type", None) == "text_delta":
+                                    if current and current["type"] == "text":
+                                        current["text"] += d.text
+                                        on_text(d.text)
+                                elif getattr(d, "type", None) == "input_json_delta":
+                                    if current and current["type"] == "tool_use":
+                                        current["_json"] += d.partial_json
+                            elif et == "content_block_stop":
+                                if current is None:
+                                    continue
+                                if current["type"] == "tool_use":
+                                    raw = current.pop("_json") or "{}"
+                                    try:
+                                        current["input"] = json.loads(raw)
+                                    except json.JSONDecodeError:
+                                        current["input"] = {}
+                                assistant_blocks.append(current)
+                                current = None
+
+                    # Сохраняем ход ассистента целиком (текст + tool_use блоки)
+                    self.history.append({"role": "assistant", "content": assistant_blocks})
+
+                    tool_uses = [b for b in assistant_blocks if b["type"] == "tool_use"]
+                    if not tool_uses:
+                        on_done()
+                        return
+
+                    # Выполняем все инструменты этого хода и отправляем результаты
+                    tool_results = []
+                    for tu in tool_uses:
+                        on_tool_call(tu["name"], tu.get("input", {}))
+                        try:
+                            result = _execute_tool(tu["name"], tu.get("input", {}))
+                            tool_results.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tu["id"],
+                                    "content": result,
+                                }
+                            )
+                            on_tool_result(tu["name"], True, result)
+                        except Exception as exc:  # noqa: BLE001
+                            msg = f"{type(exc).__name__}: {exc}"
+                            tool_results.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tu["id"],
+                                    "content": msg,
+                                    "is_error": True,
+                                }
+                            )
+                            on_tool_result(tu["name"], False, msg)
+
+                    self.history.append({"role": "user", "content": tool_results})
+                    # следующий виток цикла — модель увидит результаты и продолжит
+
+                # дошли до лимита turns — всё равно считаем завершённым
                 on_done()
             except Exception as exc:  # noqa: BLE001
                 # откатим последнее сообщение пользователя, чтобы можно было повторить
-                if self.history and self.history[-1]["role"] == "user":
+                if self.history and self.history[-1]["role"] == "user" and isinstance(
+                    self.history[-1]["content"], str
+                ):
                     self.history.pop()
                 on_error(f"{type(exc).__name__}: {exc}")
 
@@ -385,7 +631,8 @@ class OverlayApp:
         self._append(
             "meta",
             "F8 — показать/скрыть  ·  Enter — отправить  ·  "
-            "Shift+Enter — перенос  ·  Ctrl+L — сброс  ·  Ctrl+Q — выход\n\n",
+            "Shift+Enter — перенос  ·  Ctrl+L — сброс  ·  Ctrl+Q — выход\n"
+            f"workspace: {WORKSPACE}\n\n",
         )
 
     # ---- клавиши ---------------------------------------------------------
@@ -449,8 +696,23 @@ class OverlayApp:
     def send(self, text):
         self._append("user", f"» {text}\n")
 
-        def on_delta(chunk):
+        def on_text(chunk):
             self.root.after(0, lambda: self._append("assistant", chunk))
+
+        def on_tool_call(name, args):
+            # короткая превью-строка аргументов, чтобы пользователь видел что делается
+            preview = ""
+            if "path" in args:
+                preview = args["path"]
+                if "content" in args:
+                    n = len(args["content"])
+                    preview += f", {n} симв."
+            line = f"\n→ {name}({preview})"
+            self.root.after(0, lambda: self._append("meta", line))
+
+        def on_tool_result(name, ok, result):
+            mark = " ✓" if ok else f" ✗ {result}"
+            self.root.after(0, lambda: self._append("meta", mark + "\n"))
 
         def on_done():
             self.root.after(0, lambda: self._append("meta", "\n\n"))
@@ -458,7 +720,9 @@ class OverlayApp:
         def on_error(msg):
             self.root.after(0, lambda: self._append("err", f"\n[ошибка] {msg}\n\n"))
 
-        self.chat.stream_reply(text, on_delta, on_done, on_error)
+        self.chat.agentic_turn(
+            text, on_text, on_tool_call, on_tool_result, on_done, on_error
+        )
 
     def _append(self, tag, text):
         self.out.insert(tk.END, text, tag)
