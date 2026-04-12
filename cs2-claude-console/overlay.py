@@ -106,6 +106,50 @@ def _win_is_foreground(hwnd):
         return False
 
 
+def _strip_caption(hwnd):
+    """Убрать системный title bar через SetWindowLong, СОХРАНИВ окну
+    нормальную обработку фокуса в Windows.
+
+    Альтернативный путь — tk.overrideredirect(True) — на Windows ломает
+    фокус-цепочку: окно перестаёт получать WM_ACTIVATE, из-за чего Tk
+    не роутит keyboard-события в виджеты. Поэтому мы выключаем только
+    WS_CAPTION / WS_THICKFRAME / WS_SYSMENU через Win32 напрямую.
+    """
+    if not IS_WINDOWS or not hwnd:
+        return
+    GWL_STYLE = -16
+    WS_CAPTION = 0x00C00000
+    WS_THICKFRAME = 0x00040000
+    WS_SYSMENU = 0x00080000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_MAXIMIZEBOX = 0x00010000
+    SWP_NOMOVE = 0x0002
+    SWP_NOSIZE = 0x0001
+    SWP_NOZORDER = 0x0004
+    SWP_FRAMECHANGED = 0x0020
+    try:
+        style = _user32.GetWindowLongW(hwnd, GWL_STYLE)
+        style &= ~(
+            WS_CAPTION
+            | WS_THICKFRAME
+            | WS_SYSMENU
+            | WS_MINIMIZEBOX
+            | WS_MAXIMIZEBOX
+        )
+        _user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+        _user32.SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        )
+    except Exception:
+        pass
+
+
 # --- конфигурация ----------------------------------------------------------
 
 # Haiku 4.5 — самый быстрый ответ, важно во время матча.
@@ -200,12 +244,17 @@ class OverlayApp:
         self._build_widgets()
         self._bind_keys()
         self._install_global_hotkey()
-        # После того как Tk смапил окно — запомним HWND для Win32-вызовов.
+
+        # Реализуем окно, срежем системный title bar через Win32 (не через
+        # overrideredirect — он ломает фокус на Windows), потом покажем.
         self.root.update_idletasks()
         try:
             self._hwnd = self.root.winfo_id()
+            _strip_caption(self._hwnd)
         except Exception:
             self._hwnd = 0
+        self.root.deiconify()
+        self.root.after(30, self.inp.focus_force)
 
     # ---- построение окна --------------------------------------------------
 
@@ -213,7 +262,9 @@ class OverlayApp:
         r = self.root
         r.title(WINDOW_TITLE)
         r.configure(bg=BG)
-        r.overrideredirect(True)  # без рамки, без кнопок ОС
+        # Прячем до тех пор, пока не срежем title bar через Win32,
+        # чтобы нативная рамка не мелькнула при старте.
+        r.withdraw()
         r.attributes("-topmost", True)
         r.attributes("-alpha", DEFAULT_ALPHA)
         sw = r.winfo_screenwidth()
