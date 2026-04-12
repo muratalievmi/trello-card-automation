@@ -52,6 +52,46 @@ except ImportError:
     HAS_KEYBOARD = False
 
 
+# --- Win32 helpers (для кражи foreground у CS2) ----------------------------
+
+IS_WINDOWS = sys.platform.startswith("win")
+if IS_WINDOWS:
+    import ctypes
+
+    _user32 = ctypes.windll.user32
+else:
+    _user32 = None
+
+
+def _win_force_foreground(hwnd):
+    """Поднять окно в foreground на Windows, обходя foreground lock.
+
+    Используем классический AutoHotkey-трюк: симулируем нажатие Alt
+    перед SetForegroundWindow, и система считает вызов инициированным
+    пользователем. Без этого Windows блокирует кражу фокуса у CS2.
+    """
+    if not IS_WINDOWS or not hwnd:
+        return
+    try:
+        VK_MENU = 0x12
+        KEYEVENTF_KEYUP = 0x0002
+        _user32.keybd_event(VK_MENU, 0, 0, 0)
+        _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        _user32.SetForegroundWindow(hwnd)
+        _user32.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+
+
+def _win_is_foreground(hwnd):
+    if not IS_WINDOWS or not hwnd:
+        return False
+    try:
+        return _user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
 # --- конфигурация ----------------------------------------------------------
 
 # Haiku 4.5 — самый быстрый ответ, важно во время матча.
@@ -139,13 +179,19 @@ class OverlayApp:
     def __init__(self, root):
         self.root = root
         self.chat = ClaudeChat()
-        self.visible = True
         self._drag = {"x": 0, "y": 0}
+        self._hwnd = 0
 
         self._build_window()
         self._build_widgets()
         self._bind_keys()
         self._install_global_hotkey()
+        # После того как Tk смапил окно — запомним HWND для Win32-вызовов.
+        self.root.update_idletasks()
+        try:
+            self._hwnd = self.root.winfo_id()
+        except Exception:
+            self._hwnd = 0
 
     # ---- построение окна --------------------------------------------------
 
@@ -255,21 +301,32 @@ class OverlayApp:
         self.root.bind_all("<Control-L>", lambda e: self.reset())
         self.root.bind_all("<Control-q>", lambda e: self.quit())
         self.root.bind_all("<Control-Q>", lambda e: self.quit())
-        # локальный F8 — работает когда фокус в оверлее
+        # F8 как локальный fallback — работает, только если keyboard не поставился.
+        # При активном глобальном хоткее этот bind не будет вызываться (suppress=True).
         self.root.bind_all("<F8>", lambda e: self.toggle())
 
     def _install_global_hotkey(self):
-        """Глобальный F8, работающий даже когда фокус в CS2."""
+        """Глобальный F8, работающий даже когда фокус в CS2.
+
+        suppress=True — клавиша НЕ уходит в CS2, то есть если у тебя F8
+        забинден в игре, он не сработает, пока висит оверлей.
+        """
         if not HAS_KEYBOARD:
             self._append(
                 "meta",
                 "[keyboard не установлен — F8 будет работать только в оверлее]\n\n",
             )
             return
-        try:
-            keyboard.add_hotkey("f8", lambda: self.root.after(0, self.toggle))
-        except Exception as exc:  # noqa: BLE001
-            self._append("meta", f"[глобальный F8 недоступен: {exc}]\n\n")
+        # пробуем с suppress, если система не даёт — без suppress
+        for kwargs in ({"suppress": True}, {}):
+            try:
+                keyboard.add_hotkey(
+                    "f8", lambda: self.root.after(0, self.toggle), **kwargs
+                )
+                return
+            except Exception:
+                continue
+        self._append("meta", "[глобальный F8 недоступен]\n\n")
 
     # ---- перетаскивание --------------------------------------------------
 
@@ -323,13 +380,35 @@ class OverlayApp:
         self._append("meta", "История очищена.\n\n")
 
     def toggle(self):
-        self.visible = not self.visible
-        if self.visible:
-            self.root.deiconify()
-            self.root.attributes("-topmost", True)
-            self.inp.focus_force()
+        """Умный toggle как в консоли CS2.
+
+        - Окно скрыто        → показать, забрать foreground, фокус в input.
+        - Видимо, но не в fg → забрать foreground, фокус в input.
+        - Видимо и в fg      → спрятать (фокус вернётся к CS2 автоматически).
+        """
+        hidden = self.root.state() == "withdrawn"
+        if hidden or not _win_is_foreground(self._hwnd):
+            self._show_and_focus()
         else:
             self.root.withdraw()
+
+    def _show_and_focus(self):
+        r = self.root
+        r.deiconify()
+        r.attributes("-topmost", True)
+        r.lift()
+        r.update_idletasks()
+        # освежим HWND — на всякий случай, если Tk пересоздал окно
+        try:
+            self._hwnd = r.winfo_id()
+        except Exception:
+            pass
+        _win_force_foreground(self._hwnd)
+        r.focus_force()
+        # Небольшая задержка: focus на виджет надо ставить после того,
+        # как SetForegroundWindow реально перекинул активное окно,
+        # иначе Tk может "откатить" фокус при следующем событии.
+        r.after(30, self.inp.focus_force)
 
     def quit(self):
         if HAS_KEYBOARD:
